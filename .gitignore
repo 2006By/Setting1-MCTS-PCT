@@ -3,10 +3,6 @@ __pycache__/
 .ipynb_checkpoints/
 *.pyc
 # 大型数据/模型文件（可选，如果想保留就删掉这几行）
-*.pt
-logs/runinfo/
-logs/runs/
-logs/evaluation/
 cat > .gitignore << 'EOF'
 # 缓存
 
