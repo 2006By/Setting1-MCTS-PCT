@@ -102,9 +102,9 @@ def get_args():
 
 def create_environment(args):
     """Create packing environment."""
-    from pct_envs.PctDiscrete0.bin3D import PackingDiscrete
+    from pct_envs.PctContinuous0.bin3D import PackingContinuous
     
-    env = PackingDiscrete(
+    env = PackingContinuous(
         setting=args.setting,
         container_size=args.container_size,
         item_set=args.item_size_set,
@@ -148,8 +148,17 @@ def generate_items(args, env):
     return items
 
 
-def load_items_from_dataset(args):
-    """Load items from dataset file."""
+def load_items_from_dataset(args, trajectory_idx=0):
+    """
+    Load items from dataset file.
+    
+    Args:
+        args: Arguments with dataset_path and num_items
+        trajectory_idx: Which trajectory to load (0-indexed)
+        
+    Returns:
+        List of items from the specified trajectory
+    """
     if not args.dataset_path or not os.path.exists(args.dataset_path):
         raise ValueError(f"Dataset not found: {args.dataset_path}")
     
@@ -157,14 +166,31 @@ def load_items_from_dataset(args):
     
     # Handle different dataset formats
     if isinstance(data, list):
-        # List of trajectories
-        all_items = []
-        for traj in data:
-            if isinstance(traj, dict) and 'items' in traj:
-                all_items.extend(traj['items'])
-            elif isinstance(traj, (list, tuple)):
-                all_items.extend(traj)
-        return all_items[:args.num_items]
+        # List of trajectories - select specific trajectory
+        if trajectory_idx >= len(data):
+            trajectory_idx = trajectory_idx % len(data)  # Cycle if needed
+        
+        traj = data[trajectory_idx]
+        
+        if isinstance(traj, dict) and 'items' in traj:
+            items = traj['items']
+        elif isinstance(traj, (list, tuple)):
+            items = list(traj)
+        else:
+            items = [traj]
+        
+        # Convert to proper format: [[l, w, h], ...] or [(l, w, h), ...]
+        processed_items = []
+        for item in items[:args.num_items]:
+            if hasattr(item, 'tolist'):
+                processed_items.append(item.tolist())
+            elif isinstance(item, (list, tuple)):
+                processed_items.append(list(item))
+            else:
+                processed_items.append(item)
+        
+        return processed_items
+        
     elif isinstance(data, dict):
         if 'items' in data:
             return data['items'][:args.num_items]
@@ -224,20 +250,37 @@ def run_episode(args, env, planner, items, episode_idx=0):
         # Run MCTS search
         best_action, stats = planner.search(current_state, lookahead_items)
         
+        # IMPORTANT: Restore environment state after MCTS search
+        # (MCTS modifies the environment during simulations)
+        env.space.set_state(current_state)
+        
         # Execute best action
         if best_action is not None and 'error' not in stats:
             # Get leaf node for action
             leaf_node_vec = env.get_possible_position()
             
-            if best_action < len(leaf_node_vec):
+            if best_action < len(leaf_node_vec) and np.sum(leaf_node_vec[best_action]) > 0:
                 leaf_node = leaf_node_vec[best_action]
                 action, next_box = env.LeafNode2Action(leaf_node)
                 
-                # Execute step
-                obs, reward, done, info = env.step(action)
+                # Execute placement directly on space (avoid env.step side effects)
+                idx = (round(action[1], 6), round(action[2], 6))
+                rotation_flag = action[0]
+                succeeded = env.space.drop_box(next_box, idx, rotation_flag, env.next_den, args.setting)
                 
-                if not done:
+                if succeeded:
+                    # Update EMS after placement
+                    packed_box = env.space.boxes[-1]
+                    if hasattr(env, 'LNES') and env.LNES == 'EMS':
+                        env.space.GENEMS([packed_box.lx, packed_box.ly, packed_box.lz,
+                                         round(packed_box.lx + packed_box.x, 6),
+                                         round(packed_box.ly + packed_box.y, 6),
+                                         round(packed_box.lz + packed_box.z, 6)])
+                    
                     packed_count += 1
+                    box_volume = next_box[0] * next_box[1] * next_box[2]
+                    bin_volume = args.container_size[0] * args.container_size[1] * args.container_size[2]
+                    reward = (box_volume / bin_volume) * 10
                     total_reward += reward
                     
                     step_time = time.time() - step_start
@@ -249,7 +292,7 @@ def run_episode(args, env, planner, items, episode_idx=0):
                               f"ratio={ratio:.4f}, visits={stats.get('root_visits', 0)}, "
                               f"time={step_time:.2f}s")
                 else:
-                    print(f"  Step {item_idx + 1}: Bin full, stopping")
+                    print(f"  Step {item_idx + 1}: Placement failed, bin full")
                     break
             else:
                 print(f"  Step {item_idx + 1}: Invalid action {best_action}, skipping")
@@ -340,7 +383,8 @@ def main():
     for ep in range(args.num_episodes):
         # Generate or load items
         if args.load_dataset:
-            items = load_items_from_dataset(args)
+            items = load_items_from_dataset(args, trajectory_idx=ep)  # Each episode uses different trajectory
+            print(f"\nLoaded trajectory {ep + 1} with {len(items)} items")
         else:
             items = generate_items(args, env)
         
@@ -353,11 +397,16 @@ def main():
         avg_ratio = np.mean([r['space_ratio'] for r in all_results])
         std_ratio = np.std([r['space_ratio'] for r in all_results])
         avg_packed = np.mean([r['packed_count'] for r in all_results])
+        avg_step_time = np.mean([r['avg_step_time'] for r in all_results])
+        total_time = sum([r.get('total_time', r['avg_step_time'] * r['packed_count']) for r in all_results])
         
         print(f"\n{'#'*60}")
         print("Summary over all episodes:")
-        print(f"  Average Space Ratio: {avg_ratio:.4f} ± {std_ratio:.4f}")
-        print(f"  Average Packed: {avg_packed:.1f} items")
+        print(f"  Episodes: {len(all_results)}")
+        print(f"  Average Space Ratio: {avg_ratio:.4f} ({avg_ratio*100:.2f}%) ± {std_ratio:.4f}")
+        print(f"  Average Packed: {avg_packed:.1f} / {args.num_items} items")
+        print(f"  Average Step Time: {avg_step_time:.2f}s")
+        print(f"  Total Time: {total_time:.1f}s ({total_time/3600:.2f} hours)")
         print(f"{'#'*60}")
     
     return all_results

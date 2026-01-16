@@ -119,6 +119,7 @@ class MCTSNodePCT:
         Calculate PUCT score for selection.
         
         Formula: Q(s,a) + c_puct * P(s,a) * sqrt(N_parent) / (1 + N(s,a))
+        Paper Eq.5: a* = argmax_a [Q(s,a) + c_puct * P(s,a) * sqrt(sum_b N(s,b)) / (1 + N(s,a))]
         """
         exploitation = self.Q
         exploration = c_puct * self.P * math.sqrt(parent_visits) / (1 + self.N)
@@ -129,7 +130,9 @@ class MCTSNodePCT:
         if not self.children:
             return self
         
-        parent_visits = sum(child.N for child in self.children.values())
+        # PUCT formula uses parent's visit count (which is sum of all children visits)
+        # For the parent node, N = sum of all child visits after backup
+        parent_visits = self.N
         if parent_visits == 0:
             parent_visits = 1
             
@@ -263,12 +266,94 @@ class MCTSPlannerPCT:
         self.leaf_node_holder = env.leaf_node_holder
         self.next_holder = env.next_holder
         self.setting = env.setting
+        
+        # Batch size for parallel inference
+        self.batch_size = 10  # Process 10 nodes at a time
+        
+        # Cache for observations to enable batching
+        self._obs_cache = {}
+    
+    def _build_observation_for_node(self, node: MCTSNodePCT) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Build observation components for a node (for batch processing)."""
+        if len(node.lookahead_items) == 0:
+            return None, None, None
+        
+        current_item = node.lookahead_items[0]
+        
+        # Restore state
+        self.env.space.set_state(node.bin_state)
+        self.env.next_box = list(current_item[:3])
+        self.env.next_den = current_item[3] if len(current_item) > 3 else 1.0
+        
+        # Get leaf nodes
+        leaf_node_vec = self.env.get_possible_position()
+        
+        # Build next box vector
+        next_box_sorted = sorted(list(current_item[:3]))
+        next_den = current_item[3] if len(current_item) > 3 else 1.0
+        
+        next_box_vec = np.zeros((self.next_holder, 9))
+        next_box_vec[:, 3:6] = next_box_sorted
+        next_box_vec[:, 0] = next_den
+        next_box_vec[:, -1] = 1
+        
+        return self.env.space.box_vec.copy(), leaf_node_vec, next_box_vec
+    
+    def _batch_get_priors_and_values(self, nodes: List[MCTSNodePCT]) -> Tuple[List[np.ndarray], List[float]]:
+        """
+        Batch inference: get Actor priors and Critic values for multiple nodes.
+        This is the key optimization - one GPU call for multiple nodes.
+        """
+        if not nodes:
+            return [], []
+        
+        # Build batch observations
+        batch_obs = []
+        valid_nodes = []
+        leaf_node_vecs = []
+        
+        for node in nodes:
+            box_vec, leaf_vec, next_vec = self._build_observation_for_node(node)
+            if box_vec is None:
+                continue
+            
+            observation = np.concatenate([
+                box_vec.reshape(-1),
+                leaf_vec.reshape(-1),
+                next_vec.reshape(-1)
+            ])
+            batch_obs.append(observation)
+            valid_nodes.append(node)
+            leaf_node_vecs.append(leaf_vec)
+        
+        if not batch_obs:
+            return [], []
+        
+        # Stack into batch tensor
+        batch_tensor = torch.FloatTensor(np.stack(batch_obs)).reshape(
+            len(batch_obs), 
+            self.internal_node_holder + self.leaf_node_holder + self.next_holder, 
+            9
+        ).to(self.device)
+        
+        # Single GPU call for entire batch
+        with torch.no_grad():
+            _, _, _, values, dist = self.pct_policy.actor(
+                batch_tensor, 
+                evaluate_action=True,
+                normFactor=self.env.normFactor if hasattr(self.env, 'normFactor') else 1.0
+            )
+            priors_batch = dist.probs.cpu().numpy()
+            values_batch = values.cpu().numpy().flatten()
+        
+        return list(priors_batch), list(values_batch), leaf_node_vecs, valid_nodes
     
     def search(self, 
                current_state: Dict,
                lookahead_items: List[Tuple]) -> Tuple[int, Dict]:
         """
         Run MCTS search to find best action (leaf node index).
+        Optimized with batch inference for GPU efficiency.
         
         Args:
             current_state: Space state snapshot from env.space.get_state()
@@ -283,21 +368,35 @@ class MCTSPlannerPCT:
             lookahead_items=lookahead_items
         )
         
-        # Run simulations
-        for sim_idx in range(self.config.n_simulations):
-            # 1. Selection: traverse to leaf via PUCT
-            leaf = self._select(root)
+        # Run simulations in batches for better GPU utilization
+        sim_idx = 0
+        while sim_idx < self.config.n_simulations:
+            # Collect batch of leaves for parallel processing
+            batch_leaves = []
+            batch_size = min(self.batch_size, self.config.n_simulations - sim_idx)
             
-            # 2. Expansion: create children with PCT priors
-            if not leaf.is_terminal(self.config.lookahead_horizon):
-                if not leaf.is_fully_expanded():
-                    leaf = self._expand(leaf)
+            for _ in range(batch_size):
+                # 1. Selection: traverse to leaf via PUCT
+                leaf = self._select(root)
+                
+                # 2. Check if expansion needed
+                if not leaf.is_terminal(self.config.lookahead_horizon):
+                    if not leaf.is_fully_expanded():
+                        batch_leaves.append(leaf)
+                    else:
+                        # Already expanded, just evaluate and backup
+                        value = self._evaluate_fast(leaf)
+                        self._backup(leaf, value)
+                else:
+                    # Terminal node, use path rewards directly
+                    value = leaf.get_path_rewards()
+                    self._backup(leaf, value)
             
-            # 3. Evaluation: get value from PCT Critic
-            value = self._evaluate(leaf)
+            # 3. Batch expansion and evaluation
+            if batch_leaves:
+                self._batch_expand_and_evaluate(batch_leaves)
             
-            # 4. Backup: propagate value up the tree
-            self._backup(leaf, value)
+            sim_idx += batch_size
         
         # Select best action by visit count
         if not root.children:
@@ -318,6 +417,200 @@ class MCTSPlannerPCT:
         }
         
         return best_child.action_from_parent, stats
+    
+    def _batch_expand_and_evaluate(self, nodes: List[MCTSNodePCT]):
+        """
+        Batch expand and evaluate multiple nodes at once.
+        This is the key optimization for GPU efficiency.
+        """
+        if not nodes:
+            return
+        
+        # Get batch priors and values
+        result = self._batch_get_priors_and_values(nodes)
+        if len(result) < 4 or not result[0]:
+            # Fallback to sequential if batch fails
+            for node in nodes:
+                expanded = self._expand(node)
+                value = self._evaluate(expanded)
+                self._backup(expanded, value)
+            return
+        
+        priors_batch, values_batch, leaf_node_vecs, valid_nodes = result
+        
+        # Process each node with its corresponding priors
+        for i, node in enumerate(valid_nodes):
+            priors = priors_batch[i]
+            critic_value = values_batch[i]
+            leaf_node_vec = leaf_node_vecs[i]
+            
+            # Expand node using precomputed priors
+            expanded_child = self._expand_with_priors(node, priors, leaf_node_vec)
+            
+            # Calculate value (path rewards + critic)
+            if expanded_child:
+                path_rewards = expanded_child.get_path_rewards()
+                value = path_rewards + critic_value
+                self._backup(expanded_child, value)
+            else:
+                # Use node's path rewards if couldn't expand
+                value = node.get_path_rewards() + critic_value
+                self._backup(node, value)
+    
+    def _batch_evaluate_only(self, nodes: List[MCTSNodePCT]):
+        """Batch evaluate already-expanded nodes using real Critic values."""
+        if not nodes:
+            return
+        
+        batch_obs = []
+        valid_nodes = []
+        
+        for node in nodes:
+            if len(node.lookahead_items) == 0:
+                self._backup(node, node.get_path_rewards())
+                continue
+            
+            current_item = node.lookahead_items[0]
+            self.env.space.set_state(node.bin_state)
+            self.env.next_box = list(current_item[:3])
+            self.env.next_den = current_item[3] if len(current_item) > 3 else 1.0
+            
+            leaf_node_vec = self.env.get_possible_position()
+            next_box_sorted = sorted(list(current_item[:3]))
+            next_den = current_item[3] if len(current_item) > 3 else 1.0
+            
+            next_box_vec = np.zeros((self.next_holder, 9))
+            next_box_vec[:, 3:6] = next_box_sorted
+            next_box_vec[:, 0] = next_den
+            next_box_vec[:, -1] = 1
+            
+            observation = np.concatenate([
+                self.env.space.box_vec.reshape(-1),
+                leaf_node_vec.reshape(-1),
+                next_box_vec.reshape(-1)
+            ])
+            batch_obs.append(observation)
+            valid_nodes.append(node)
+        
+        if not batch_obs:
+            return
+        
+        batch_tensor = torch.FloatTensor(np.stack(batch_obs)).reshape(
+            len(batch_obs), self.internal_node_holder + self.leaf_node_holder + self.next_holder, 9
+        ).to(self.device)
+        
+        with torch.no_grad():
+            _, _, _, values = self.pct_policy(batch_tensor, deterministic=True)
+            critic_values = values.cpu().numpy().flatten()
+        
+        for i, node in enumerate(valid_nodes):
+            value = node.get_path_rewards() + critic_values[i]
+            self._backup(node, value)
+    
+    def _expand_with_priors(self, node: MCTSNodePCT, priors: np.ndarray, 
+                            leaf_node_vec: np.ndarray) -> Optional[MCTSNodePCT]:
+        """Expand node using precomputed priors (avoids extra GPU call)."""
+        if len(node.lookahead_items) == 0:
+            return None
+        
+        current_item = node.lookahead_items[0]
+        remaining_items = node.lookahead_items[1:]
+        
+        # Get valid action mask
+        valid_mask = leaf_node_vec[:, 8] > 0
+        valid_indices = np.where(valid_mask)[0]
+        
+        if len(valid_indices) == 0:
+            node._is_terminal = True
+            return None
+        
+        # Apply mask and renormalize priors
+        masked_priors = np.zeros_like(priors)
+        masked_priors[valid_indices] = priors[valid_indices]
+        prior_sum = masked_priors.sum()
+        if prior_sum > 0:
+            masked_priors /= prior_sum
+        else:
+            masked_priors[valid_indices] = 1.0 / len(valid_indices)
+        
+        # Create child nodes for ALL valid actions (don't limit to preserve quality)
+        # Sorting by prior helps prioritize good actions first
+        sorted_indices = np.argsort(masked_priors)[::-1]
+        top_indices = [i for i in sorted_indices if i in valid_indices]
+        
+        self.env.next_box = list(current_item[:3])
+        self.env.next_den = current_item[3] if len(current_item) > 3 else 1.0
+        
+        first_child = None
+        for action_idx in top_indices:
+            if action_idx in node.children:
+                if first_child is None:
+                    first_child = node.children[action_idx]
+                continue
+            
+            leaf_node = leaf_node_vec[action_idx]
+            action, next_box = self.env.LeafNode2Action(leaf_node)
+            
+            # Execute virtual placement
+            self.env.space.set_state(node.bin_state)
+            success = self.env.space.drop_box(
+                next_box, 
+                (action[1], action[2]), 
+                action[0],
+                self.env.next_den,
+                self.setting
+            )
+            
+            if not success:
+                continue
+            
+            # Get new state
+            new_state = self.env.space.get_state()
+            
+            # Calculate WSP reward
+            placed_box = {
+                'x': next_box[0], 'y': next_box[1], 'z': next_box[2],
+                'lx': action[1], 'ly': action[2], 
+                'lz': self.env.space.boxes[-1].lz if self.env.space.boxes else 0
+            }
+            
+            r_prime, _ = calculate_wsp(
+                new_state['boxes_data'],
+                placed_box,
+                self.bin_size,
+                self.config.wsp_weight
+            )
+            
+            # Create child node
+            child = MCTSNodePCT(
+                bin_state=new_state,
+                lookahead_items=remaining_items,
+                parent=node,
+                action_from_parent=int(action_idx),
+                prior=masked_priors[action_idx]
+            )
+            child.immediate_reward = r_prime
+            node.children[int(action_idx)] = child
+            
+            if first_child is None:
+                first_child = child
+        
+        return first_child
+    
+    def _evaluate_fast(self, node: MCTSNodePCT) -> float:
+        """Fast evaluation using cached critic value if available."""
+        path_rewards = node.get_path_rewards()
+        
+        if node.is_terminal(self.config.lookahead_horizon):
+            return path_rewards
+        
+        # For non-terminal, we need critic value - use average Q as estimate
+        # This avoids extra GPU call during selection phase
+        if node.children:
+            avg_child_q = sum(c.Q for c in node.children.values()) / len(node.children)
+            return path_rewards + avg_child_q
+        
+        return path_rewards
     
     def _select(self, node: MCTSNodePCT) -> MCTSNodePCT:
         """Selection phase: traverse tree using PUCT until leaf."""
@@ -340,7 +633,7 @@ class MCTSPlannerPCT:
         remaining_items = node.lookahead_items[1:]
         
         # Restore environment state
-        self.env.space.restore_state(node.bin_state)
+        self.env.space.set_state(node.bin_state)
         
         # Get valid placements (leaf nodes) for current item
         self.env.next_box = list(current_item[:3])  # (l, w, h)
@@ -360,14 +653,28 @@ class MCTSPlannerPCT:
             node._is_terminal = True
             return node
         
-        # Get PCT observation and prior probabilities
-        observation = self.env.cur_observation()
+        # Build observation manually to avoid cur_observation() modifying state
+        # Observation = [internal_nodes (box_vec), leaf_nodes, next_box_vec]
+        next_box_sorted = sorted(list(current_item[:3]))
+        next_den = current_item[3] if len(current_item) > 3 else 1.0
+        
+        next_box_vec = np.zeros((self.next_holder, 9))
+        next_box_vec[:, 3:6] = next_box_sorted
+        next_box_vec[:, 0] = next_den
+        next_box_vec[:, -1] = 1
+        
+        observation = np.concatenate([
+            self.env.space.box_vec.reshape(-1),
+            leaf_node_vec.reshape(-1),
+            next_box_vec.reshape(-1)
+        ])
+        
         obs_tensor = torch.FloatTensor(observation).reshape(
             1, self.internal_node_holder + self.leaf_node_holder + self.next_holder, 9
         ).to(self.device)
         
         with torch.no_grad():
-            # PCT forward pass
+            # PCT forward pass to get action priors
             _, _, _, _, dist = self.pct_policy.actor(
                 obs_tensor, 
                 evaluate_action=True,
@@ -395,7 +702,7 @@ class MCTSPlannerPCT:
             action, next_box = self.env.LeafNode2Action(leaf_node)
             
             # Execute virtual placement
-            self.env.space.restore_state(node.bin_state)
+            self.env.space.set_state(node.bin_state)
             success = self.env.space.drop_box(
                 next_box, 
                 (action[1], action[2]), 
@@ -451,21 +758,49 @@ class MCTSPlannerPCT:
         Evaluation phase: get value from PCT Critic.
         
         Returns cumulative path reward + Critic value estimate.
+        Paper Section 3.4: V_path = sum(r'_{t+k}) + V(S_leaf)
         """
-        if node.is_terminal(self.config.lookahead_horizon):
-            # Terminal: use current space ratio as value
-            self.env.space.restore_state(node.bin_state)
-            return node.get_path_rewards()
+        # Path value = cumulative immediate rewards from root to this node
+        path_rewards = node.get_path_rewards()
         
-        # Get Critic value estimate
-        self.env.space.restore_state(node.bin_state)
+        if node.is_terminal(self.config.lookahead_horizon):
+            # Terminal node: return only path rewards (no future value)
+            return path_rewards
+        
+        # Get Critic value estimate for non-terminal node
+        self.env.space.set_state(node.bin_state)
         
         if len(node.lookahead_items) > 0:
             current_item = node.lookahead_items[0]
             self.env.next_box = list(current_item[:3])
             self.env.next_den = current_item[3] if len(current_item) > 3 else 1.0
+            
+            # Build observation manually
+            leaf_node_vec = self.env.get_possible_position()
+            
+            next_box_sorted = sorted(list(current_item[:3]))
+            next_den = current_item[3] if len(current_item) > 3 else 1.0
+            
+            next_box_vec = np.zeros((self.next_holder, 9))
+            next_box_vec[:, 3:6] = next_box_sorted
+            next_box_vec[:, 0] = next_den
+            next_box_vec[:, -1] = 1
+            
+            observation = np.concatenate([
+                self.env.space.box_vec.reshape(-1),
+                leaf_node_vec.reshape(-1),
+                next_box_vec.reshape(-1)
+            ])
+        else:
+            # No more items, use empty observation
+            leaf_node_vec = np.zeros((self.leaf_node_holder, 9))
+            next_box_vec = np.zeros((self.next_holder, 9))
+            observation = np.concatenate([
+                self.env.space.box_vec.reshape(-1),
+                leaf_node_vec.reshape(-1),
+                next_box_vec.reshape(-1)
+            ])
         
-        observation = self.env.cur_observation()
         obs_tensor = torch.FloatTensor(observation).reshape(
             1, self.internal_node_holder + self.leaf_node_holder + self.next_holder, 9
         ).to(self.device)
@@ -474,8 +809,7 @@ class MCTSPlannerPCT:
             _, _, _, values = self.pct_policy(obs_tensor, deterministic=True)
             critic_value = values.item()
         
-        # Path value = cumulative rewards + Critic estimate
-        path_rewards = node.get_path_rewards()
+        # Total value = path rewards + Critic value estimate
         return path_rewards + critic_value
     
     def _backup(self, node: MCTSNodePCT, value: float):

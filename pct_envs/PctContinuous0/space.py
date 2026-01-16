@@ -320,6 +320,71 @@ class Space(object):
         assert ratio <= 1.0
         return ratio
 
+    def get_state(self):
+        """
+        Get a snapshot of the current space state for MCTS tree search.
+        Optimized version using numpy copy instead of deepcopy where safe.
+        """
+        import copy
+        
+        # Convert Box objects to dictionaries for WSP calculation
+        boxes_data = []
+        for box in self.boxes:
+            boxes_data.append({
+                'x': box.x, 'y': box.y, 'z': box.z,
+                'lx': box.lx, 'ly': box.ly, 'lz': box.lz
+            })
+        
+        # Use numpy copy for arrays (much faster than deepcopy)
+        # MUST use deepcopy for boxes as Box objects are mutable
+        state = {
+            'upLetter': self.upLetter.copy(),      # numpy copy
+            'letterIdx': self.letterIdx,
+            'box_vec': self.box_vec.copy(),        # numpy copy
+            'NOEMS': self.NOEMS,
+            'EMS': self.EMS.copy(),                # numpy copy
+            'boxes': copy.deepcopy(self.boxes),    # MUST deepcopy - Box objects are mutable!
+            'boxes_data': boxes_data,              # For WSP calculation
+            'box_idx': self.box_idx,
+            'serial_number': self.serial_number,
+            'ZMAP': self._copy_zmap(),             # optimized ZMAP copy
+            'height': self.height,
+        }
+        return state
+    
+    def _copy_zmap(self):
+        """Optimized ZMAP copying."""
+        new_zmap = {}
+        for k, v in self.ZMAP.items():
+            new_zmap[k] = {kk: list(vv) if isinstance(vv, list) else vv for kk, vv in v.items()}
+        return new_zmap
+
+    def set_state(self, state):
+        """
+        Restore space state from a snapshot for MCTS tree search.
+        Optimized version using numpy copy instead of deepcopy where safe.
+        """
+        import copy
+        
+        # Use numpy copy for arrays
+        self.upLetter = state['upLetter'].copy()
+        self.letterIdx = state['letterIdx']
+        self.box_vec = state['box_vec'].copy()
+        self.NOEMS = state['NOEMS']
+        self.EMS = state['EMS'].copy()
+        self.boxes = copy.deepcopy(state['boxes'])  # MUST deepcopy - Box objects are mutable!
+        self.box_idx = state['box_idx']
+        self.serial_number = state['serial_number']
+        self.ZMAP = self._restore_zmap(state['ZMAP'])
+        self.height = state['height']
+    
+    def _restore_zmap(self, zmap_state):
+        """Optimized ZMAP restoration."""
+        new_zmap = {}
+        for k, v in zmap_state.items():
+            new_zmap[k] = {kk: list(vv) if isinstance(vv, list) else vv for kk, vv in v.items()}
+        return new_zmap
+
     def scale_down(self, bottom_whole_contact_area):
         centre2D = np.mean(bottom_whole_contact_area, axis=0)
         dirction2D = bottom_whole_contact_area - centre2D
