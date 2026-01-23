@@ -16,9 +16,11 @@ import sys
 import os
 import argparse
 import time
+import json
 import torch
 import numpy as np
 import random
+from datetime import datetime
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -82,6 +84,12 @@ def get_args():
     parser.add_argument('--verbose', action='store_true',
                         help='Print detailed progress')
     
+    # Save results for visualization
+    parser.add_argument('--save-results', action='store_true',
+                        help='Save episode results to JSON for visualization in notebook')
+    parser.add_argument('--result-dir', type=str, default='./mcts_results',
+                        help='Directory to save results')
+    
     args = parser.parse_args()
     
     # Derive additional parameters
@@ -98,6 +106,68 @@ def get_args():
     args.normFactor = 1.0 / np.max(args.container_size)
     
     return args
+
+
+def save_episode_boxes(boxes, container_size, episode_idx, results, output_dir='./mcts_results'):
+    """
+    Save episode packing result to JSON file for visualization.
+    
+    The saved format is compatible with the notebook's plot_cube_plotly function:
+    cube_definition = [[l, w, h, x, y, z], ...] where:
+        l, w, h = box dimensions (size)
+        x, y, z = box position (lower corner)
+    
+    Args:
+        boxes: List of Box objects from env.space.boxes
+        container_size: [length, width, height] of container
+        episode_idx: Episode index
+        results: Episode statistics dict
+        output_dir: Output directory
+        
+    Returns:
+        str: Path to saved JSON file
+    """
+    date_str = datetime.now().strftime('%Y-%m-%d')
+    folder_path = os.path.join(output_dir, date_str)
+    if not os.path.exists(folder_path):
+        os.makedirs(folder_path)
+    
+    # Convert Box objects to the format expected by notebook's plot_cube_plotly:
+    # [l, w, h, x, y, z] = [box.x, box.y, box.z, box.lx, box.ly, box.lz]
+    cube_definition = []
+    for i, box in enumerate(boxes):
+        cube_definition.append([
+            float(box.x),   # length (l)
+            float(box.y),   # width (w) 
+            float(box.z),   # height (h)
+            float(box.lx),  # x position
+            float(box.ly),  # y position
+            float(box.lz),  # z position
+            i + 1           # label (optional 7th element)
+        ])
+    
+    data = {
+        'episode': episode_idx,
+        'container_size': list(container_size),
+        'cube_definition': cube_definition,  # Ready for plot_cube_plotly()
+        'statistics': {
+            'packed_count': results.get('packed_count', len(boxes)),
+            'total_items': results.get('total_items', 0),
+            'space_ratio': results.get('space_ratio', 0),
+            'total_reward': results.get('total_reward', 0),
+            'timestamp': datetime.now().isoformat()
+        }
+    }
+    
+    time_str = datetime.now().strftime('%H_%M_%S')
+    file_name = f'episode_{episode_idx}_{time_str}.json'
+    file_path = os.path.join(folder_path, file_name)
+    
+    with open(file_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    
+    print(f"Episode result saved to: {file_path}")
+    return file_path
 
 
 def create_environment(args):
@@ -391,6 +461,16 @@ def main():
         # Run episode
         results = run_episode(args, env, planner, items, ep)
         all_results.append(results)
+        
+        # Save results for visualization in notebook
+        if args.save_results:
+            save_episode_boxes(
+                boxes=env.space.boxes,
+                container_size=args.container_size,
+                episode_idx=ep,
+                results=results,
+                output_dir=args.result_dir
+            )
     
     # Summary statistics
     if len(all_results) > 1:
