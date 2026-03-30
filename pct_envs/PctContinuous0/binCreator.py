@@ -38,6 +38,19 @@ class RandomBoxCreator(BoxCreator):
         idx = np.random.randint(0, len(self.box_set))
         self.box_list.append(self.box_set[idx])
 
+def _normalize_box_trajs(raw):
+    """兼容两种格式：① 多条轨迹 ② 扁平单条轨迹 [box1,box2,...]（每条 box 为 [x,y,z] 或 [x,y,z,d]）"""
+    if not raw:
+        return []
+    first = raw[0]
+    try:
+        if len(first) in (3, 4) and all(isinstance(x, (int, float)) for x in first):
+            return [raw]
+    except (TypeError, IndexError):
+        pass
+    return raw
+
+
 class LoadBoxCreator(BoxCreator):
     def __init__(self, data_name=None):
         super().__init__()
@@ -45,8 +58,9 @@ class LoadBoxCreator(BoxCreator):
         print("load data set successfully!")
         self.index = 0
         self.box_index = 0
-        self.traj_nums = len(torch.load(self.data_name))
-        self.box_trajs = torch.load(self.data_name)
+        raw = torch.load(self.data_name)
+        self.box_trajs = _normalize_box_trajs(raw)
+        self.traj_nums = len(self.box_trajs)
 
     def reset(self, index=None):
         self.box_list.clear()
@@ -57,8 +71,13 @@ class LoadBoxCreator(BoxCreator):
             self.index = index
         # 循环使用轨迹，防止索引越界
         self.index = self.index % self.traj_nums
-        self.boxes = np.array(self.box_trajs[self.index])
+        traj = self.box_trajs[self.index]
+        self.boxes = np.array(traj)
         self.boxes = self.boxes.tolist()
+        if self.boxes and not isinstance(self.boxes[0], (list, tuple)):
+            self.boxes = []
+        elif self.boxes and len(self.boxes[0]) not in (3, 4):
+            self.boxes = [list(b)[:4] for b in self.boxes if hasattr(b, '__len__') and len(b) >= 3]
         self.box_index = 0
         self.box_set = self.boxes
         self.box_set.append([100, 100, 100, 1.0])  # 添加 density 以支持 setting3

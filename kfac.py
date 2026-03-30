@@ -19,8 +19,6 @@ def _extract_patches(x, kernel_size, stride, padding):
 
 
 def compute_cov_a(a, classname, layer_info, fast_cnn):
-    batch_size = a.size(0)
-
     if classname == 'Conv2d':
         if fast_cnn:
             a = _extract_patches(a, *layer_info)
@@ -31,16 +29,23 @@ def compute_cov_a(a, classname, layer_info, fast_cnn):
             a = a.view(-1, a.size(-1)).div_(a.size(1)).div_(a.size(2))
     elif classname == 'AddBias':
         is_cuda = a.is_cuda
-        a = torch.ones(a.size(0), 1)
+        if a.dim() == 4:
+            a = torch.ones(a.size(0), 1)
+        elif a.dim() == 3:
+            a = torch.ones(a.size(0) * a.size(1), 1)
+        else:
+            a = torch.ones(a.size(0), 1)
         if is_cuda:
             a = a.cuda()
+    else:
+        if len(a.size()) > 2:
+            a = a.view(-1, a.size(-1))
 
+    batch_size = a.size(0)
     return a.t() @ (a / batch_size)
 
 
 def compute_cov_g(g, classname, layer_info, fast_cnn):
-    batch_size = g.size(0)
-
     if classname == 'Conv2d':
         if fast_cnn:
             g = g.view(g.size(0), g.size(1), -1)
@@ -49,11 +54,19 @@ def compute_cov_g(g, classname, layer_info, fast_cnn):
             g = g.transpose(1, 2).transpose(2, 3).contiguous()
             g = g.view(-1, g.size(-1)).mul_(g.size(1)).mul_(g.size(2))
     elif classname == 'AddBias':
-        g = g.view(g.size(0), g.size(1), -1)
-        g = g.sum(-1)
+        if g.dim() == 4:
+            g = g.view(g.size(0), g.size(1), -1).sum(-1)
+        elif g.dim() == 3:
+            g = g.view(-1, g.size(-1))
+        else:
+            g = g.view(g.size(0), -1) # Flatten if 2D or 1D
+    else:
+        if len(g.size()) > 2:
+            g = g.view(-1, g.size(-1))
 
+    batch_size = g.size(0)
     g_ = g * batch_size
-    return g_.t() @ (g_ / g.size(0))
+    return g_.t() @ (g_ / batch_size)
 
 
 def update_running_stat(aa, m_aa, momentum):
@@ -218,7 +231,10 @@ class KFACOptimizer(optim.Optimizer):
         for p in self.model.parameters():
             if p.requires_grad == False:
                 continue
-            v = updates[p]
+            if p in updates:
+                v = updates[p]
+            else:
+                v = p.grad.data
             vg_sum += (v * p.grad.data * self.lr * self.lr).sum()
 
 
@@ -227,7 +243,10 @@ class KFACOptimizer(optim.Optimizer):
         for p in self.model.parameters():
             if p.requires_grad == False:
                 continue
-            v = updates[p]
+            if p in updates:
+                v = updates[p]
+            else:
+                v = p.grad.data
             p.grad.data.copy_(v)
             p.grad.data.mul_(nu)
 

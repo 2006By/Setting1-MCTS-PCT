@@ -12,6 +12,7 @@ class PackingDiscrete(gym.Env):
                  item_set=None, data_name=None, load_test_data=False,
                  internal_node_holder=80, leaf_node_holder=50, next_holder=1, shuffle=False,
                  LNES = 'EMS',
+                 train_data_name=None,
                  **kwags):
 
         self.internal_node_holder = internal_node_holder
@@ -30,12 +31,14 @@ class PackingDiscrete(gym.Env):
         self.space = Space(*self.bin_size, self.size_minimum, self.internal_node_holder)
 
         # Generator for train/test data
-        if not load_test_data:
+        if load_test_data:
+            self.box_creator = LoadBoxCreator(data_name)
+        elif train_data_name is not None:
+            self.box_creator = LoadBoxCreator(train_data_name)
+        else:
             assert item_set is not None
             self.box_creator = RandomBoxCreator(item_set)
             assert isinstance(self.box_creator, BoxCreator)
-        if load_test_data:
-            self.box_creator = LoadBoxCreator(data_name)
 
         self.test = load_test_data
         self.observation_space = gym.spaces.Box(low=0.0, high=self.space.height,
@@ -71,6 +74,9 @@ class PackingDiscrete(gym.Env):
         boxes = []
         leaf_nodes = []
         self.next_box = self.gen_next_box()
+        # 防御性检查：确保 next_box 是列表/元组而非单个 float
+        if isinstance(self.next_box, (int, float)):
+            self.next_box = [self.next_box, self.next_box, self.next_box]
 
         if self.test:
             if self.setting == 3: self.next_den = self.next_box[3]

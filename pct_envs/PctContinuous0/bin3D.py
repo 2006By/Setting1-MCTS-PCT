@@ -14,6 +14,7 @@ class PackingContinuous(gym.Env):
                  sample_from_distribution = True,
                  sample_left_bound = 0.1,
                  sample_right_bound = 0.5,
+                 train_data_name=None,
                  **kwags):
 
         self.internal_node_holder = internal_node_holder
@@ -36,14 +37,17 @@ class PackingContinuous(gym.Env):
         self.space = Space(*self.bin_size, self.size_minimum, self.internal_node_holder)
 
         # Generator for train/test data
-        if not load_test_data:
+        if load_test_data:
+            self.box_creator = LoadBoxCreator(data_name)
+        elif train_data_name is not None:
+            self.box_creator = LoadBoxCreator(train_data_name)
+        else:
             assert item_set is not None
             self.box_creator = RandomBoxCreator(item_set)
             assert isinstance(self.box_creator, BoxCreator)
 
         self.sample_from_distribution = sample_from_distribution
-        if load_test_data:
-            self.box_creator = LoadBoxCreator(data_name)
+        self.use_loaded_train_data = (train_data_name is not None)
 
         self.test = load_test_data
         self.observation_space = gym.spaces.Box(low=0.0, high=self.space.height,
@@ -79,12 +83,18 @@ class PackingContinuous(gym.Env):
         boxes = []
         leaf_nodes = []
         self.next_box = self.gen_next_box()
+        # 防御性检查：确保 next_box 是列表/元组而非单个 float
+        if isinstance(self.next_box, (int, float)):
+            self.next_box = [self.next_box, self.next_box, self.next_box]
         if self.test:
             if self.setting == 3: self.next_den = self.next_box[3]
             else: self.next_den = 1
             self.next_box = [round(self.next_box[0], 3), round(self.next_box[1], 3), round(self.next_box[2], 3)]
         else:
-            if self.setting < 3: self.next_den = 1
+            if self.setting < 3:
+                self.next_den = 1
+                # 确保 next_box 只保留前3个维度 (l, w, h)，去掉可能存在的 density
+                self.next_box = [round(self.next_box[0], 3), round(self.next_box[1], 3), round(self.next_box[2], 3)]
             else:
                 # 对于 setting3，优先使用数据集中的 density（如果存在）
                 if len(self.next_box) >= 4:
@@ -107,7 +117,7 @@ class PackingContinuous(gym.Env):
 
     # Generate the next item to be placed.
     def gen_next_box(self):
-        if self.sample_from_distribution and not self.test:
+        if self.sample_from_distribution and not self.test and not self.use_loaded_train_data:
             if self.setting == 2:
                 next_box = (round(np.random.uniform(self.sample_left_bound,self.sample_right_bound), 3),
                         round(np.random.uniform(self.sample_left_bound,self.sample_right_bound), 3),

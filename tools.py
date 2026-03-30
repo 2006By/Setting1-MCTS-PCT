@@ -163,6 +163,7 @@ def get_args():
     parser.add_argument('--model-path', type=str, help='The path to load model')
     parser.add_argument('--load-dataset', action='store_true', help='Load an existing dataset, otherwise the data is generated on the fly')
     parser.add_argument('--dataset-path', type=str, help='The path to load dataset')
+    parser.add_argument('--train-dataset-path', type=str, default=None, help='The path to load training dataset (train with custom data instead of random sampling)')
 
     parser.add_argument('--sample-from-distribution', action='store_true', help='Sample continuous item size from a uniform distribution U(a,b), otherwise sample items from \'item_size_set\' in \'givenData.py\'')
     parser.add_argument('--sample-left-bound', type=float, metavar='a', help='The parametre a of distribution U(a,b)')

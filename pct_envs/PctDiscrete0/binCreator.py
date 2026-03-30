@@ -38,6 +38,20 @@ class RandomBoxCreator(BoxCreator):
         idx = np.random.randint(0, len(self.box_set))
         self.box_list.append(self.box_set[idx])
 
+def _normalize_box_trajs(raw):
+    """兼容两种格式：① 多条轨迹 [[traj1],[traj2],...] ② 扁平单条轨迹 [box1,box2,...]（每条 box 为 [x,y,z]）"""
+    if not raw:
+        return []
+    first = raw[0]
+    # 若首条是长度为 3 的数列（一个箱子），则视为扁平列表，整份当作一条轨迹
+    try:
+        if len(first) == 3 and isinstance(first[0], (int, float)):
+            return [raw]
+    except (TypeError, IndexError):
+        pass
+    return raw
+
+
 class LoadBoxCreator(BoxCreator):
     def __init__(self, data_name=None):
         super().__init__()
@@ -45,8 +59,9 @@ class LoadBoxCreator(BoxCreator):
         print("load data set successfully!")
         self.index = 0
         self.box_index = 0
-        self.traj_nums = len(torch.load(self.data_name))
-        self.box_trajs = torch.load(self.data_name)
+        raw = torch.load(self.data_name)
+        self.box_trajs = _normalize_box_trajs(raw)
+        self.traj_nums = len(self.box_trajs)
 
     def reset(self, index=None):
         self.box_list.clear()
@@ -55,8 +70,15 @@ class LoadBoxCreator(BoxCreator):
             self.index += 1
         else:
             self.index = index
-        self.boxes = np.array(self.box_trajs[self.index])
+        self.index = self.index % self.traj_nums
+        traj = self.box_trajs[self.index]
+        self.boxes = np.array(traj)
         self.boxes = self.boxes.tolist()
+        # 保证每项为 [x,y,z]：若为标量则说明轨迹被错误展平，跳过
+        if self.boxes and not isinstance(self.boxes[0], (list, tuple)):
+            self.boxes = []
+        elif self.boxes and len(self.boxes[0]) != 3:
+            self.boxes = [list(b)[:3] for b in self.boxes if hasattr(b, '__len__') and len(b) >= 3]
         self.box_index = 0
         self.box_set = self.boxes
         self.box_set.append([100, 100, 100])

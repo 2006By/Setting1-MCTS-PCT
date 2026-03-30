@@ -1,8 +1,83 @@
 import givenData
 import numpy as np
+import time
 from pct_envs.PctDiscrete0 import PackingDiscrete
 from pct_envs.PctContinuous0 import PackingContinuous
 from tools import get_args_heuristic
+
+
+def _compute_height_map(space, container_size, grid_size=16):
+    g = max(4, int(grid_size))
+    heights = np.zeros((g, g), dtype=np.float32)
+    boxes = getattr(space, 'boxes', [])
+    if len(boxes) == 0:
+        return heights
+
+    width, length, _ = container_size
+    cell_w = width / g
+    cell_l = length / g
+
+    for box in boxes:
+        x0, y0 = float(box.lx), float(box.ly)
+        x1, y1 = x0 + float(box.x), y0 + float(box.y)
+        top_h = float(box.lz + box.z)
+
+        ix0 = max(0, int(np.floor(x0 / cell_w)))
+        ix1 = min(g - 1, int(np.ceil(x1 / cell_w) - 1))
+        iy0 = max(0, int(np.floor(y0 / cell_l)))
+        iy1 = min(g - 1, int(np.ceil(y1 / cell_l) - 1))
+        if ix1 < ix0 or iy1 < iy0:
+            continue
+
+        for ix in range(ix0, ix1 + 1):
+            cx0, cx1 = ix * cell_w, (ix + 1) * cell_w
+            overlap_x = min(x1, cx1) - max(x0, cx0)
+            if overlap_x <= 1e-9:
+                continue
+            for iy in range(iy0, iy1 + 1):
+                cy0, cy1 = iy * cell_l, (iy + 1) * cell_l
+                overlap_y = min(y1, cy1) - max(y0, cy0)
+                if overlap_y <= 1e-9:
+                    continue
+                if top_h > heights[ix, iy]:
+                    heights[ix, iy] = top_h
+    return heights
+
+
+def _compute_flatness_score(space, container_size, grid_size=16):
+    height_map = _compute_height_map(space, container_size, grid_size=grid_size)
+    occupied = height_map > 0
+    occupied_count = int(np.sum(occupied))
+    if occupied_count == 0:
+        return 0.0
+
+    occ_heights = height_map[occupied]
+    height_std = float(np.std(occ_heights))
+    flatness_raw = 1.0 - height_std / (float(container_size[2]) + 1e-8)
+    flatness_raw = float(np.clip(flatness_raw, 0.0, 1.0))
+
+    coverage_ratio = float(occupied_count) / float(height_map.size)
+    score = flatness_raw * (0.5 + 0.5 * coverage_ratio)
+    return float(np.clip(score, 0.0, 1.0))
+
+
+def _record_episode_metrics(env, counter, episode_utilization, episode_length,
+                            episode_flatness, episode_ms_per_box, episode_start_time,
+                            flatness_grid_size=16):
+    result = env.space.get_ratio()
+    l = len(env.space.boxes)
+    flatness = _compute_flatness_score(env.space, env.bin_size, grid_size=flatness_grid_size)
+    ep_elapsed = time.perf_counter() - episode_start_time
+    ep_ms_per_box = ep_elapsed * 1000.0 / l if l > 0 else 0.0
+
+    print(
+        'Result of episode {}, utilization: {}, length: {}, flatness: {:.4f}, e2e(ms/box): {:.4f}'
+        .format(counter, result, l, flatness, ep_ms_per_box)
+    )
+    episode_utilization.append(result)
+    episode_length.append(l)
+    episode_flatness.append(flatness)
+    episode_ms_per_box.append(ep_ms_per_box)
 
 '''
 Tap-net: transportand-pack using reinforcement learning.
@@ -54,7 +129,10 @@ def MACS(env, times = 2000):
     done = False
     episode_utilization = []
     episode_length = []
+    episode_flatness = []
+    episode_ms_per_box = []
     env.reset()
+    episode_start_time = time.perf_counter()
 
     container_size = env.bin_size
     container = np.zeros(env.bin_size)
@@ -63,11 +141,12 @@ def MACS(env, times = 2000):
         while True:
             if done:
                 # Reset the enviroment when the episode is done
-                result = env.space.get_ratio()
-                l = len(env.space.boxes)
-                print('Result of episode {}, utilization: {}, length: {}'.format(counter, result, l))
-                episode_utilization.append(result), episode_length.append(l)
+                _record_episode_metrics(
+                    env, counter, episode_utilization, episode_length,
+                    episode_flatness, episode_ms_per_box, episode_start_time
+                )
                 env.reset()
+                episode_start_time = time.perf_counter()
                 container[:] = 0
                 block_index = 0
                 done = False
@@ -129,7 +208,12 @@ def MACS(env, times = 2000):
                 # No feasible placement, this episode is done.
                 done = True
 
-    return  np.mean(episode_utilization), np.var(episode_utilization), np.mean(episode_length)
+    return {
+        'ratios': episode_utilization,
+        'placed': episode_length,
+        'flatness_scores': episode_flatness,
+        'e2e_ms_per_box_episode': episode_ms_per_box
+    }
 
 '''
 Solving a new 3D bin packing problem with deep reinforcement learning method.
@@ -140,7 +224,10 @@ def LASH(env, times = 2000):
     done = False
     episode_utilization = []
     episode_length = []
+    episode_flatness = []
+    episode_ms_per_box = []
     env.reset()
+    episode_start_time = time.perf_counter()
     bin_size = env.bin_size
 
     maxXY = [0,0]
@@ -150,11 +237,12 @@ def LASH(env, times = 2000):
         while True:
             if done:
                 # Reset the enviroment when the episode is done
-                result = env.space.get_ratio()
-                l = len(env.space.boxes)
-                print('Result of episode {}, utilization: {}, length: {}'.format(counter, result, l))
-                episode_utilization.append(result), episode_length.append(l)
+                _record_episode_metrics(
+                    env, counter, episode_utilization, episode_length,
+                    episode_flatness, episode_ms_per_box, episode_start_time
+                )
                 env.reset()
+                episode_start_time = time.perf_counter()
                 done = False
                 maxXY = [0, 0]
                 minXY = [bin_size[0], bin_size[1]]
@@ -223,7 +311,12 @@ def LASH(env, times = 2000):
                 # No feasible placement, this episode is done.
                 done = True
 
-    return  np.mean(episode_utilization), np.var(episode_utilization), np.mean(episode_length)
+    return {
+        'ratios': episode_utilization,
+        'placed': episode_length,
+        'flatness_scores': episode_flatness,
+        'e2e_ms_per_box_episode': episode_ms_per_box
+    }
 
 '''
 Stable bin packing of non-convex 3D objects with a robot manipulator.
@@ -233,18 +326,22 @@ def heightmap_min(env, times = 2000):
     done = False
     episode_utilization = []
     episode_length = []
+    episode_flatness = []
+    episode_ms_per_box = []
     env.reset()
+    episode_start_time = time.perf_counter()
     bin_size = env.bin_size
 
     for counter in range(times):
         while True:
             if done:
                 # Reset the enviroment when the episode is done
-                result = env.space.get_ratio()
-                l = len(env.space.boxes)
-                print('Result of episode {}, utilization: {}, length: {}'.format(counter, result, l))
-                episode_utilization.append(result), episode_length.append(l)
+                _record_episode_metrics(
+                    env, counter, episode_utilization, episode_length,
+                    episode_flatness, episode_ms_per_box, episode_start_time
+                )
                 env.reset()
+                episode_start_time = time.perf_counter()
                 done = False
                 break
 
@@ -292,7 +389,12 @@ def heightmap_min(env, times = 2000):
                 # No feasible placement, this episode is done.
                 done = True
 
-    return  np.mean(episode_utilization), np.var(episode_utilization), np.mean(episode_length)
+    return {
+        'ratios': episode_utilization,
+        'placed': episode_length,
+        'flatness_scores': episode_flatness,
+        'e2e_ms_per_box_episode': episode_ms_per_box
+    }
 
 '''
 Randomly pick placements from full coordinates.
@@ -301,18 +403,22 @@ def random(env, times = 2000):
     done = False
     episode_utilization = []
     episode_length = []
+    episode_flatness = []
+    episode_ms_per_box = []
     env.reset()
+    episode_start_time = time.perf_counter()
     bin_size = env.bin_size
 
     for counter in range(times):
         while True:
             if done:
                 # Reset the enviroment when the episode is done
-                result = env.space.get_ratio()
-                l = len(env.space.boxes)
-                print('Result of episode {}, utilization: {}, length: {}'.format(counter, result, l))
-                episode_utilization.append(result), episode_length.append(l)
+                _record_episode_metrics(
+                    env, counter, episode_utilization, episode_length,
+                    episode_flatness, episode_ms_per_box, episode_start_time
+                )
                 env.reset()
+                episode_start_time = time.perf_counter()
                 done = False
                 break
 
@@ -354,7 +460,12 @@ def random(env, times = 2000):
                 # No feasible placement, this episode is done.
                 done = True
 
-    return  np.mean(episode_utilization), np.var(episode_utilization), np.mean(episode_length)
+    return {
+        'ratios': episode_utilization,
+        'placed': episode_length,
+        'flatness_scores': episode_flatness,
+        'e2e_ms_per_box_episode': episode_ms_per_box
+    }
 
 '''
 An Online Packing Heuristic for the Three-Dimensional Container Loading
@@ -365,17 +476,21 @@ def OnlineBPH(env, times = 2000):
     done = False
     episode_utilization = []
     episode_length = []
+    episode_flatness = []
+    episode_ms_per_box = []
     env.reset()
+    episode_start_time = time.perf_counter()
 
     for counter in range(times):
         while True:
             if done:
                 # Reset the enviroment when the episode is done
-                result = env.space.get_ratio()
-                l = len(env.space.boxes)
-                print('Result of episode {}, utilization: {}, length: {}'.format(counter, result, l))
-                episode_utilization.append(result), episode_length.append(l)
+                _record_episode_metrics(
+                    env, counter, episode_utilization, episode_length,
+                    episode_flatness, episode_ms_per_box, episode_start_time
+                )
                 env.reset()
+                episode_start_time = time.perf_counter()
                 done = False
                 break
 
@@ -422,7 +537,12 @@ def OnlineBPH(env, times = 2000):
                 # No feasible placement, this episode is done.
                 done = True
 
-    return np.mean(episode_utilization), np.var(episode_utilization), np.mean(episode_length)
+    return {
+        'ratios': episode_utilization,
+        'placed': episode_length,
+        'flatness_scores': episode_flatness,
+        'e2e_ms_per_box_episode': episode_ms_per_box
+    }
 
 '''
 A Hybrid Genetic Algorithm for Packing in 3D with Deepest Bottom Left with Fill Method
@@ -432,18 +552,22 @@ def DBL(env, times = 2000):
     done = False
     episode_utilization = []
     episode_length = []
+    episode_flatness = []
+    episode_ms_per_box = []
     env.reset()
+    episode_start_time = time.perf_counter()
     bin_size = env.bin_size
 
     for counter in range(times):
         while True:
             if done:
                 # Reset the enviroment when the episode is done
-                result = env.space.get_ratio()
-                l = len(env.space.boxes)
-                print('Result of episode {}, utilization: {}, length: {}'.format(counter, result, l))
-                episode_utilization.append(result), episode_length.append(l)
+                _record_episode_metrics(
+                    env, counter, episode_utilization, episode_length,
+                    episode_flatness, episode_ms_per_box, episode_start_time
+                )
                 env.reset()
+                episode_start_time = time.perf_counter()
                 done = False
                 break
 
@@ -491,7 +615,12 @@ def DBL(env, times = 2000):
                 # No feasible placement, this episode is done.
                 done = True
 
-    return np.mean(episode_utilization), np.var(episode_utilization), np.mean(episode_length)
+    return {
+        'ratios': episode_utilization,
+        'placed': episode_length,
+        'flatness_scores': episode_flatness,
+        'e2e_ms_per_box_episode': episode_ms_per_box
+    }
 
 '''
 Online 3D Bin Packing with Constrained Deep Reinforcement Learning
@@ -515,18 +644,22 @@ def BR(env, times = 2000):
     done = False
     episode_utilization = []
     episode_length = []
+    episode_flatness = []
+    episode_ms_per_box = []
     env.reset()
+    episode_start_time = time.perf_counter()
 
     for counter in range(times):
         while True:
 
             if done:
                 # Reset the enviroment when the episode is done
-                result = env.space.get_ratio()
-                l = len(env.space.boxes)
-                print('Result of episode {}, utilization: {}, length: {}'.format(counter, result, l))
-                episode_utilization.append(result), episode_length.append(l)
+                _record_episode_metrics(
+                    env, counter, episode_utilization, episode_length,
+                    episode_flatness, episode_ms_per_box, episode_start_time
+                )
                 env.reset()
+                episode_start_time = time.perf_counter()
                 done = False
                 break
             
@@ -574,7 +707,12 @@ def BR(env, times = 2000):
                 # No feasible placement, this episode is done.
                 done = True
 
-    return  np.mean(episode_utilization), np.var(episode_utilization), np.mean(episode_length)
+    return {
+        'ratios': episode_utilization,
+        'placed': episode_length,
+        'flatness_scores': episode_flatness,
+        'e2e_ms_per_box_episode': episode_ms_per_box
+    }
 
 if __name__ == '__main__':
     args = get_args_heuristic()
@@ -590,21 +728,87 @@ if __name__ == '__main__':
                      internal_node_holder = 80,
                      leaf_node_holder = 1000)
 
-    if args.heuristic == 'LSAH':
-        mean, var, length = LASH(env, args.evaluation_episodes)
-    elif args.heuristic == 'MACS':
-        mean, var, length = MACS(env, args.evaluation_episodes)
-    elif args.heuristic == 'HM':
-        mean, var, length = heightmap_min(env, args.evaluation_episodes)
-    elif args.heuristic == 'RANDOM':
-        mean, var, length = random(env, args.evaluation_episodes)
-    elif args.heuristic == 'OnlineBPH':
-        mean, var, length = OnlineBPH(env, args.evaluation_episodes)
-    elif args.heuristic == 'DBL':
-        mean, var, length = DBL(env, args.evaluation_episodes)
-    elif args.heuristic == 'BR':
-        mean, var, length = BR(env, args.evaluation_episodes)
+    eval_start = time.perf_counter()
 
-    print('The average space utilization:', mean)
-    print('The variance of space utilization:', var)
-    print('The average number of packed items:', length)
+    if args.heuristic == 'LSAH':
+        results = LASH(env, args.evaluation_episodes)
+    elif args.heuristic == 'MACS':
+        results = MACS(env, args.evaluation_episodes)
+    elif args.heuristic == 'HM':
+        results = heightmap_min(env, args.evaluation_episodes)
+    elif args.heuristic == 'RANDOM':
+        results = random(env, args.evaluation_episodes)
+    elif args.heuristic == 'OnlineBPH':
+        results = OnlineBPH(env, args.evaluation_episodes)
+    elif args.heuristic == 'DBL':
+        results = DBL(env, args.evaluation_episodes)
+    elif args.heuristic == 'BR':
+        results = BR(env, args.evaluation_episodes)
+    else:
+        raise ValueError(f"Unknown heuristic: {args.heuristic}")
+
+    elapsed_s = time.perf_counter() - eval_start
+    ratios = np.asarray(results.get('ratios', []), dtype=np.float64)
+    placed = np.asarray(results.get('placed', []), dtype=np.float64)
+    flatness_scores = np.asarray(results.get('flatness_scores', []), dtype=np.float64)
+    e2e_ms_ep = np.asarray(results.get('e2e_ms_per_box_episode', []), dtype=np.float64)
+
+    if ratios.size == 0:
+        raise RuntimeError("No episode results were collected.")
+
+    mean_ratio = float(np.mean(ratios))
+    std_ratio = float(np.std(ratios))
+    var_ratio = float(np.var(ratios))
+    max_ratio = float(np.max(ratios))
+    min_ratio = float(np.min(ratios))
+
+    mean_placed = float(np.mean(placed)) if placed.size > 0 else 0.0
+    std_placed = float(np.std(placed)) if placed.size > 0 else 0.0
+    var_placed = float(np.var(placed)) if placed.size > 0 else 0.0
+
+    mean_flatness = float(np.mean(flatness_scores)) if flatness_scores.size > 0 else 0.0
+    std_flatness = float(np.std(flatness_scores)) if flatness_scores.size > 0 else 0.0
+    var_flatness = float(np.var(flatness_scores)) if flatness_scores.size > 0 else 0.0
+    max_flatness = float(np.max(flatness_scores)) if flatness_scores.size > 0 else 0.0
+    min_flatness = float(np.min(flatness_scores)) if flatness_scores.size > 0 else 0.0
+
+    total_boxes = float(np.sum(placed)) if placed.size > 0 else 0.0
+    e2e_ms_global = elapsed_s * 1000.0 / total_boxes if total_boxes > 0 else 0.0
+    e2e_ms_mean_episode = float(np.mean(e2e_ms_ep)) if e2e_ms_ep.size > 0 else 0.0
+    e2e_ms_std_episode = float(np.std(e2e_ms_ep)) if e2e_ms_ep.size > 0 else 0.0
+    e2e_ms_var_episode = float(np.var(e2e_ms_ep)) if e2e_ms_ep.size > 0 else 0.0
+
+    print("\n" + "="*50)
+    print(f"EVALUATION RESULTS (Heuristic-{args.heuristic})")
+    print("="*50)
+    print(f"Heuristic: {args.heuristic}")
+    print(f"Test Data: {args.dataset_path}")
+    print(f"Episodes: {len(ratios)}")
+    print(f"Setting: {args.setting} | Continuous: {args.continuous}")
+    print("Space Utilization:")
+    print(f"  Mean: {mean_ratio:.4f} ({mean_ratio*100:.2f}%)")
+    print(f"  Std:  {std_ratio:.4f}")
+    print(f"  Var:  {var_ratio:.6f}")
+    print(f"  Max:  {max_ratio:.4f} ({max_ratio*100:.2f}%)")
+    print(f"  Min:  {min_ratio:.4f} ({min_ratio*100:.2f}%)")
+    print("Boxes Placed:")
+    print(f"  Mean: {mean_placed:.1f}")
+    print(f"  Std:  {std_placed:.4f}")
+    print(f"  Var:  {var_placed:.4f}")
+    print("Packing Flatness:")
+    print(f"  Mean: {mean_flatness:.4f}")
+    print(f"  Std:  {std_flatness:.4f}")
+    print(f"  Var:  {var_flatness:.6f}")
+    print(f"  Max:  {max_flatness:.4f}")
+    print(f"  Min:  {min_flatness:.4f}")
+    print("Timing:")
+    print("  Model inference total: N/A (heuristic search)")
+    print("  Model inference mean:  N/A")
+    print("  Model inference std:   N/A")
+    print("  Model inference var:   N/A")
+    print(f"  End-to-end total: {elapsed_s:.4f}s")
+    print(f"  End-to-end mean(global): {e2e_ms_global:.4f} ms/box")
+    print(f"  End-to-end mean(episode): {e2e_ms_mean_episode:.4f} ms/box")
+    print(f"  End-to-end std(episode):  {e2e_ms_std_episode:.4f} ms/box")
+    print(f"  End-to-end var(episode):  {e2e_ms_var_episode:.6f} (ms/box)^2")
+    print("="*50)
